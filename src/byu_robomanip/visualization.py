@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 import pyqtgraph.opengl as gl
+from pyqtgraph.opengl import shaders as gl_shaders
+from pyqtgraph.opengl.items.GLLinePlotItem import GLLinePlotItem
 from pyqtgraph.opengl.items import GLTextItem
 import pyqtgraph as pg
 import matplotlib.pyplot as plt
@@ -25,15 +27,74 @@ from matplotlib.widgets import Slider
 from time import perf_counter, sleep, time
 import signal
 
-red = np.array([0.7, 0, 0, 1])
+red = np.array([0.8, 0, 0, 1])
 green = np.array([0, 0.7, 0, 1])
-blue = np.array([0, 0, 0.7, 1])
+blue = np.array([0, 0, 0.8, 1])
 dark_red = np.array([0.3, 0, 0, 1])
 dark_green = np.array([0, 0.3, 0, 1])
 dark_blue = np.array([0, 0, 0.3, 1])
 white = np.array([1, 1, 1, 1])
 grey = np.array([0.3, 0.3, 0.3, 1])
 yellow = np.array([223.0 / 255.0, 238.0 / 255.0, 95.0 / 255.0, 1.0])
+
+# Set this to "shaded" to immediately return to PyQtGraph's standard shader.
+ARM_SHADER = "byu_lighter_shaded"
+
+
+def _register_lighter_arm_shader() -> None:
+    """Register the optional arm shader with a higher ambient-light level."""
+    gl_shaders.ShaderProgram(
+        ARM_SHADER,
+        [
+            gl_shaders.VertexShader(
+                """
+                uniform mat4 u_mvp;
+                uniform mat3 u_normal;
+                attribute vec4 a_position;
+                attribute vec3 a_normal;
+                attribute vec4 a_color;
+                varying vec4 v_color;
+                varying vec3 v_normal;
+                void main() {
+                    v_normal = normalize(u_normal * a_normal);
+                    v_color = a_color;
+                    gl_Position = u_mvp * a_position;
+                }
+                """
+            ),
+            gl_shaders.FragmentShader(
+                """
+                #ifdef GL_ES
+                precision mediump float;
+                #endif
+                varying vec4 v_color;
+                varying vec3 v_normal;
+                void main() {
+                    float light = max(dot(v_normal, normalize(vec3(1.0, -1.0, -1.0))), 0.0);
+                    float brightness = 0.3 + 0.7 * light;
+                    gl_FragColor = vec4(v_color.rgb * brightness, v_color.a);
+                }
+                """
+            ),
+        ],
+    )
+
+
+_register_lighter_arm_shader()
+
+
+def _reset_opengl_shader_caches() -> None:
+    """Reset PyQtGraph shader handles before creating a new GL context.
+
+    PyQtGraph 0.14 stores shader programs at module/class scope even though
+    OpenGL program handles belong to a particular context.  This matters in a
+    long-lived Jupyter kernel: closing one ``VizScene`` destroys its context,
+    but the next scene otherwise reuses the old handles.  Text items continue
+    to render while mesh and line items fail with OpenGL attribute errors.
+    """
+    GLLinePlotItem._shaderProgram = None
+    for shader_program in gl_shaders.ShaderProgram.names.values():
+        shader_program.prog = None
 
 
 class TransformMPL:
@@ -243,6 +304,7 @@ class VizScene:
         self.grid = gl.GLGridItem(color=(0, 0, 0, 76.5))
         self.grid.scale(1, 1, 1)
         self.window.addItem(self.grid)
+        self.grid.hide()
         self.window.setCameraPosition(distance=self.range)
         self.window.setBackgroundColor("w")
         self.window.show()
@@ -815,7 +877,18 @@ class VizScene:
         self.app.processEvents()
 
     def close_viz(self):
-        self.app.closeAllWindows()
+        """Close this scene and release its OpenGL resources.
+
+        The Qt application is intentionally left running because it may be
+        owned by a Jupyter kernel or by another visualization.  Resetting
+        PyQtGraph's process-global shader caches makes a later ``VizScene``
+        safe after this widget's OpenGL context has been destroyed.
+        """
+        self.window.clear()
+        self.window.close()
+        self.window.deleteLater()
+        self.app.processEvents()
+        _reset_opengl_shader_caches()
 
 
 class ArmPlayer:
@@ -1095,14 +1168,11 @@ class ArmMeshObject:
         joint_width = np.max([arm_scale, 0.10]) * 0.30
         joint_height = np.max([arm_scale, 0.10]) * 0.70
 
-        # TODO: change rotary joints from cuboids to cylinders.
-        # See example from "add_marker" about to easily generate a
-        # cylinder mesh. - Killpack
-
         for i in range(self.n):
             self.link_objects.append(
                 LinkMeshObject(
                     self.dh[i],
+                    jt=arm.jt[i],
                     link_width=link_width,
                     joint_width=joint_width,
                     joint_height=joint_height,
@@ -1134,9 +1204,9 @@ class ArmMeshObject:
         self.mesh_object = gl.GLMeshItem(
             vertexes=self.mesh,
             vertexColors=self.colors,
-            drawEdges=True,
-            computeNormals=False,
-            edgeColor=np.array([0, 0, 0, 1]),
+            drawEdges=False,
+            computeNormals=True,
+            shader=ARM_SHADER,
         )
 
     def update(self, q=None):
@@ -1235,18 +1305,55 @@ class LinkMeshObject:
 
         self.link_points = self.link_points @ R.T
 
-        self.joint_points = np.array(
-            [
-                [0.5 * w, -0.5 * w, -0.5 * h],
-                [-0.5 * w, -0.5 * w, -0.5 * h],
-                [-0.5 * w, -0.5 * w, 0.5 * h],
-                [0.5 * w, -0.5 * w, 0.5 * h],
-                [0.5 * w, 0.5 * w, -0.5 * h],
-                [-0.5 * w, 0.5 * w, -0.5 * h],
-                [-0.5 * w, 0.5 * w, 0.5 * h],
-                [0.5 * w, 0.5 * w, 0.5 * h],
-            ]
-        )
+        if jt == "r":
+            cylinder = gl.MeshData.cylinder(
+                rows=10, cols=20, radius=[w / 2] * 2, length=h
+            )
+            vertices = cylinder.vertexes()
+            faces = cylinder.faces()
+
+            bottom_center = len(vertices)
+            top_center = bottom_center + 1
+            vertices = np.vstack(
+                [vertices, [0.0, 0.0, 0.0], [0.0, 0.0, h]]
+            )
+            bottom_ring = np.arange(20, dtype=np.uint32)
+            top_ring = bottom_ring + 10 * 20
+            next_bottom_ring = np.roll(bottom_ring, -1)
+            next_top_ring = np.roll(top_ring, -1)
+            cap_faces = np.vstack(
+                [
+                    np.column_stack(
+                        [
+                            np.full(20, bottom_center, dtype=np.uint32),
+                            next_bottom_ring,
+                            bottom_ring,
+                        ]
+                    ),
+                    np.column_stack(
+                        [
+                            np.full(20, top_center, dtype=np.uint32),
+                            top_ring,
+                            next_top_ring,
+                        ]
+                    ),
+                ]
+            )
+            vertices[:, 2] -= h / 2
+            self.joint_points = vertices[np.vstack([faces, cap_faces])]
+        else:
+            self.joint_points = np.array(
+                [
+                    [0.5 * w, -0.5 * w, -0.5 * h],
+                    [-0.5 * w, -0.5 * w, -0.5 * h],
+                    [-0.5 * w, -0.5 * w, 0.5 * h],
+                    [0.5 * w, -0.5 * w, 0.5 * h],
+                    [0.5 * w, 0.5 * w, -0.5 * h],
+                    [-0.5 * w, 0.5 * w, -0.5 * h],
+                    [-0.5 * w, 0.5 * w, 0.5 * h],
+                    [0.5 * w, 0.5 * w, 0.5 * h],
+                ]
+            )
 
         Rz = np.array(
             [
@@ -1276,8 +1383,9 @@ class LinkMeshObject:
             joint_color = np.array([0.35, 0, 0.0, 1])
         elif not isinstance(joint_color, (np.ndarray)):
             joint_color = np.array(joint_color)
-        self.joint_colors = np.zeros((12, 3, 4)) + joint_color
-        self.joint_colors[6:8, :, :] = np.zeros((2, 3, 4)) + grey
+        self.joint_colors = np.zeros((len(self.joint_points), 3, 4)) + joint_color
+        if jt != "r":
+            self.joint_colors[6:8, :, :] = np.zeros((2, 3, 4)) + grey
 
     @staticmethod
     def points_to_mesh(link_points, joint_points):
@@ -1325,6 +1433,9 @@ class LinkMeshObject:
         lp = self.link_points @ R.T + p
         jp = self.joint_points @ R.T + p
 
+        if jp.ndim == 3:
+            link_mesh = self.points_to_mesh(lp, np.zeros((8, 3)))[:12]
+            return np.vstack((link_mesh, jp))
         return self.points_to_mesh(lp, jp)
 
 
