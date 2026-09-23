@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QSpacerItem,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
 import pyqtgraph.opengl as gl
 from pyqtgraph.opengl import shaders as gl_shaders
 from pyqtgraph.opengl.items.GLLinePlotItem import GLLinePlotItem
@@ -278,6 +278,10 @@ class VizScene:
     (which are plots or quiver type things), scatter points, and lines."""
 
     def __init__(self):
+        # A notebook may construct a new scene after an earlier scene was
+        # closed, while the QApplication itself remains alive.
+        _reset_opengl_shader_caches()
+        self._closed = False
         self.arms: list[ArmMeshObject] = []
         self.frames: list[FrameViz] = []
         self.axes: list[AxisViz] = []
@@ -304,13 +308,22 @@ class VizScene:
         self.grid = gl.GLGridItem(color=(0, 0, 0, 76.5))
         self.grid.scale(1, 1, 1)
         self.window.addItem(self.grid)
-        self.grid.hide()
         self.window.setCameraPosition(distance=self.range)
         self.window.setBackgroundColor("w")
         self.window.show()
         self.window.raise_()
         self.window.opts["center"] = pg.Vector(0, 0, 0)
 
+        self.app.processEvents()
+
+    def show_grid(self):
+        """Show the reference grid for this scene."""
+        self.grid.show()
+        self.app.processEvents()
+
+    def hide_grid(self):
+        """Hide the reference grid for this scene."""
+        self.grid.hide()
         self.app.processEvents()
 
     def add_arm(
@@ -635,6 +648,12 @@ class VizScene:
             while time() < end and self.window.isVisible():
                 self.app.processEvents()
 
+        # A user closing the window ends the hold loop. Clean up immediately
+        # so a later notebook cell can safely create another VizScene even if
+        # it does not retain the old scene object to call close_viz().
+        if not self.window.isVisible():
+            self.close_viz()
+
     def wander(self, index=None, q0=None, speed=1e-1, duration=np.inf, accel=5e-4):
         if index is None:
             index = range(len(self.arms))
@@ -884,9 +903,13 @@ class VizScene:
         PyQtGraph's process-global shader caches makes a later ``VizScene``
         safe after this widget's OpenGL context has been destroyed.
         """
+        if self._closed:
+            return
+        self._closed = True
         self.window.clear()
         self.window.close()
         self.window.deleteLater()
+        QCoreApplication.sendPostedEvents(self.window, QEvent.Type.DeferredDelete)
         self.app.processEvents()
         _reset_opengl_shader_caches()
 
